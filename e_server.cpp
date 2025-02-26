@@ -1,185 +1,190 @@
 #include <iostream>
-#include <unistd.h>
 #include <sys/socket.h>
-#include <sys/epoll.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
+#include <unistd.h>
 #include <fcntl.h>
+#include <sys/epoll.h>
 #include <cstring>
 #include <vector>
+#include <algorithm>
 
 #define MAX_EVENTS 10
-#define PORT 8080
+#define PORT 12345
+#define BUFFER_SIZE 1024
 
-// 设置文件描述符为非阻塞
+// 设置非阻塞模式
 int setNonBlocking(int fd)
 {
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1)
-    {
-        perror("fcntl");
-        return -1;
-    }
-    flags |= O_NONBLOCK;
-    if (fcntl(fd, F_SETFL, flags) == -1)
-    {
-        perror("fcntl");
-        return -1;
-    }
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     return 0;
-}
-
-// 处理客户端消息
-void handleClientMessage(int clientFd)
-{
-    char buffer[1024];
-    ssize_t bytesRead;
-
-    while (true)
-    {
-        // 从客户端读取数据，尽可能多地读取数据
-        bytesRead = read(clientFd, buffer, sizeof(buffer) - 1);
-        if (bytesRead < 0)
-        {
-            if (errno != EAGAIN && errno != EWOULDBLOCK)
-            {
-                perror("read");
-                close(clientFd);
-            }
-            break; // 如果没有更多数据可读，则退出
-        }
-        else if (bytesRead == 0)
-        {
-            // 客户端关闭连接
-            std::cout << "Client disconnected" << std::endl;
-            close(clientFd);
-            break;
-        }
-        else
-        {
-            // 输出客户端消息并回送
-            buffer[bytesRead] = '\0';
-            std::cout << "Received: " << buffer << std::endl;
-            send(clientFd, buffer, bytesRead, 0);
-        }
-    }
 }
 
 int main()
 {
-    int serverFd, clientFd, epollFd;
-    struct sockaddr_in serverAddr;
+    int server_fd, epoll_fd;
+    struct sockaddr_in server_addr;
     struct epoll_event event, events[MAX_EVENTS];
 
-    // 创建服务器套接字
-    serverFd = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverFd == -1)
+    // 创建服务器端 socket
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == -1)
     {
-        perror("socket");
+        perror("socket failed");
         return -1;
     }
 
-    // 设置套接字地址结构
-    memset(&serverAddr, 0, sizeof(serverAddr));
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port = htons(PORT);
+    // 设置服务器端地址
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
 
-    // 绑定套接字
-    if (bind(serverFd, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) == -1)
+    // 绑定地址
+    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1)
     {
-        perror("bind");
-        close(serverFd);
+        perror("bind failed");
+        close(server_fd);
         return -1;
     }
 
-    // 监听连接
-    if (listen(serverFd, 5) == -1)
+    // 监听连接请求
+    if (listen(server_fd, 10) == -1)
     {
-        perror("listen");
-        close(serverFd);
-        return -1;
-    }
-
-    // 设置服务器套接字为非阻塞
-    if (setNonBlocking(serverFd) == -1)
-    {
-        close(serverFd);
+        perror("listen failed");
+        close(server_fd);
         return -1;
     }
 
     // 创建 epoll 实例
-    epollFd = epoll_create1(0);
-    if (epollFd == -1)
+    epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1)
     {
-        perror("epoll_create1");
-        close(serverFd);
+        perror("epoll_create1 failed");
+        close(server_fd);
         return -1;
     }
 
-    // 注册监听事件到 epoll，使用边缘触发
-    event.events = EPOLLIN | EPOLLET; // 可读事件，边缘触发
-    event.data.fd = serverFd;
-    if (epoll_ctl(epollFd, EPOLL_CTL_ADD, serverFd, &event) == -1)
+    // 将服务器套接字加入 epoll 实例，监听可读事件
+    setNonBlocking(server_fd);
+    event.data.fd = server_fd;
+    event.events = EPOLLIN | EPOLLET; // 边缘触发
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event) == -1)
     {
-        perror("epoll_ctl");
-        close(serverFd);
+        perror("epoll_ctl failed");
+        close(server_fd);
         return -1;
     }
 
-    std::cout << "Server is listening on port " << PORT << "..." << std::endl;
+    std::vector<int> client_fds;
 
-    // 主循环，等待并处理事件
+    // 进入事件循环
     while (true)
     {
-        int numEvents = epoll_wait(epollFd, events, MAX_EVENTS, -1);
-        if (numEvents == -1)
+        int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        if (num_events == -1)
         {
-            perror("epoll_wait");
+            perror("epoll_wait failed");
             break;
         }
 
-        for (int i = 0; i < numEvents; i++)
+        for (int i = 0; i < num_events; i++)
         {
-            if (events[i].data.fd == serverFd)
+            if (events[i].data.fd == server_fd)
             {
-                // 新客户端连接
-                clientFd = accept(serverFd, nullptr, nullptr);
-                if (clientFd == -1)
+                // 新客户端连接请求
+                int client_fd = accept(server_fd, NULL, NULL);
+                if (client_fd == -1)
                 {
-                    perror("accept");
+                    perror("accept failed");
                     continue;
                 }
 
-                std::cout << "New client connected" << std::endl;
+                // 设置非阻塞模式
+                setNonBlocking(client_fd);
 
-                // 设置客户端为非阻塞
-                if (setNonBlocking(clientFd) == -1)
+                // 将新客户端加入 epoll 监听
+                event.data.fd = client_fd;
+                event.events = EPOLLIN | EPOLLET; // 边缘触发
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event) == -1)
                 {
-                    close(clientFd);
+                    perror("epoll_ctl failed");
+                    close(client_fd);
                     continue;
                 }
 
-                // 注册客户端套接字到 epoll，使用边缘触发
-                event.events = EPOLLIN | EPOLLET; // 可读事件，边缘触发
-                event.data.fd = clientFd;
-                if (epoll_ctl(epollFd, EPOLL_CTL_ADD, clientFd, &event) == -1)
-                {
-                    perror("epoll_ctl");
-                    close(clientFd);
-                    continue;
-                }
+                // 保存客户端文件描述符
+                client_fds.push_back(client_fd);
+                std::cout << "New client connected: " << client_fd << std::endl;
             }
             else if (events[i].events & EPOLLIN)
             {
-                // 客户端发送数据
-                handleClientMessage(events[i].data.fd);
+                // 读取客户端数据
+                int client_fd = events[i].data.fd;
+                char buffer[BUFFER_SIZE];
+                // ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer));
+
+                // 边缘触发模式下，必须尽量读取所有数据
+                while (true)
+                {
+                    int bytes_read = read(client_fd, buffer, sizeof(buffer));
+                    if (bytes_read == 0)
+                    {
+                        // 客户端断开连接
+                        close(client_fd);
+                        break;
+                    }
+                    else if (bytes_read < 0)
+                    {
+                        // 错误发生或没有数据
+                        if (errno == EAGAIN)
+                        {
+                            break; // 数据读取完毕
+                        }
+                        else
+                        {
+                            perror("read");
+                            close(client_fd);
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        // 处理读取的数据
+                    }
+                }
+
+                if (bytes_read == -1)
+                {
+                    perror("read failed");
+                    continue;
+                }
+                else if (bytes_read == 0)
+                {
+                    // 客户端断开连接
+                    std::cout << "Client disconnected: " << client_fd << std::endl;
+                    close(client_fd);
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
+                    client_fds.erase(std::remove(client_fds.begin(), client_fds.end(), client_fd), client_fds.end());
+                    continue;
+                }
+
+                // 将接收到的数据转发给所有客户端
+                for (int fd : client_fds)
+                {
+                    if (fd != client_fd)
+                    { // 不发送给自己
+                        if (send(fd, buffer, bytes_read, 0) == -1)
+                        {
+                            perror("send failed");
+                        }
+                    }
+                }
             }
         }
     }
 
     // 清理
-    close(serverFd);
-    close(epollFd);
+    close(server_fd);
+    close(epoll_fd);
     return 0;
 }
